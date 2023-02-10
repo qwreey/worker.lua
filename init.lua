@@ -628,7 +628,6 @@ end
 --     ---@param handler workerChildHandler
 --     function(handler)
 --         handler.onRequest(function(data)
---             -- 대충 복잡도가 미친듯이 큰 무언가
 --             print(handler.request())
 --             return data + 1
 --         end)
@@ -637,16 +636,9 @@ end
 -- )
 
 -- work:onRequest(function(data)
---     -- error("너가 왜 보내냐?")
 --     return "wow"
 -- end)
 -- work:ready()
--- print("준비됨")
 -- print(work:request(32))
--- print(work:request(99))
--- print(work:request(123123))
--- work:kill()
--- require"logger".info(work)
--- print("적당히해라")
 
 return worker
