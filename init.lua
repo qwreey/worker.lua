@@ -420,8 +420,8 @@ local READY_CHUNK = '{"id":"READY"}'
 function worker.new(name,workHandler)
     if type(name) ~= "string" then
         error(("worker.new argument #1 'name' must be string, but got %s"):format(name))
-    elseif workHandler ~= nil and type(workHandler) ~= "function" then
-        error(("worker.new argument #2 'workHandler' must be function or nil, but got %s"):format(workHandler))
+    elseif workHandler ~= nil and type(workHandler) ~= "function" and type(workHandler) ~= "string" then
+        error(("worker.new argument #2 'workHandler' must be function or string or nil, but got %s"):format(workHandler))
     end
 
     ---@type worker
@@ -526,6 +526,18 @@ function worker.new(name,workHandler)
     end)
 
     return this
+end
+
+function worker:clone()
+    local name = self.__name
+    if not name then error("This worker may broken (have no name)") end
+    if name:match("%(%d+%)$") then
+        name = name:gsub("%((%d+)%)$",function(str)
+            return ("(%d)"):format(tonumber(str)+1)
+        end)
+    else name = name .. " - Clone (1)"
+    end
+    return worker.new(name,self.__dumped)
 end
 
 function worker:onRead(err, chunk)
