@@ -119,6 +119,7 @@ function worker.__inner(dumped,bundles,path,cpath,read_fd,write_fd,thread_name,.
     ---@param func function set Callback function, return value is sent into main thread. if alreadly setted, will overwrite last function
     function handler.onRequest(func)
         handler.__func = func
+        setfenv(func,{require = require "require"(".")})
     end
     ---Set this worker thread ready and make handshake with main thread
     ---YOU SHOULD CALL THIS FUNCTION AFTER ALL HANDLER FUNCTION BINDED
@@ -158,20 +159,35 @@ function worker.__inner(dumped,bundles,path,cpath,read_fd,write_fd,thread_name,.
     handler.args = table.pack(...)
     fn_env.handler = handler
 
-    local READY = '{"id":"READY"}'
-    local KILL = '{"id":"KILL"}'
+
+    local READY_CHUNK = '{"id":"READY"}'
+    local READY_REQUEST = '{"id":"READY"}\n'
+    local KILL_REQUEST = '{"id":"KILL"}\n'
+    local KILL_CHUNK = '{"id":"KILL"}'
+
     local killed
+    local queue = {}
+    local running = false
+    local insert = table.insert
+    local remove = table.remove
+    local gmatch = string.gmatch
+    local function runNext()
+        if next(queue) then
+            coroutine.resume(remove(queue))
+        end
+        running = false
+    end
     local function onRead(err, chunk)
         if err then
             printerr(("error occurred on reading pipe : %s"):format(tostring(err)))
             uv.close(read_pipe)
-            pcall(write_pipe.write,write_pipe,'{"id":"CLOSE"}')
+            pcall(write_pipe.write,write_pipe,'{"id":"CLOSE"}\n')
             uv.close(write_pipe)
             return
         end
 
         -- handshake
-        if chunk == READY then
+        if chunk == READY_CHUNK then
             local waitter = handler.__waiting_ready
             if waitter then
                 local pass,resumeErr = coroutine.resume(waitter)
@@ -179,9 +195,9 @@ function worker.__inner(dumped,bundles,path,cpath,read_fd,write_fd,thread_name,.
             else
                 printerr("received READY before waitter setted")
             end
-            write_pipe:write('{"id":"START"}')
+            write_pipe:write('{"id":"START"}\n')
             return
-        elseif chunk == KILL then
+        elseif chunk == KILL_CHUNK then
             read_pipe:read_stop()
             read_pipe:close()
             write_pipe:close()
@@ -241,22 +257,44 @@ function worker.__inner(dumped,bundles,path,cpath,read_fd,write_fd,thread_name,.
                 printerr(("error occurred on calling onRequest function\n%s\nchunk : %s"):format(tostring(result),tostring(chunk)))
                 write_pipe:write(json.encode{
                     i=id; e=tostring(result); r=0
-                })
+                }.."\n")
                 return
             end
 
             -- write result
             write_pipe:write(json.encode{
                 i=id; d=result; r=0
-            })
+            }.."\n")
             return
         else
             printerr(("unknown direction int got (%s)\nchunk : %s"):format(tostring(direction),tostring(chunk)))
             return
         end
     end
+    local function queueOnRead(pipeError,pipeChunk)
+        if running then
+            insert(queue,coroutine.running())
+            coroutine.yield()
+        end
+        running = true
+        local passed,err
+        if pipeError or not pipeChunk then
+            passed,err = pcall(onRead,pipeError,pipeChunk)
+            if not passed then
+                printerr(("error occurred on onRead() \n%s"):format(err))
+            end
+        else
+            for str in gmatch(pipeChunk,"[^\n]+") do
+                passed,err = pcall(onRead,pipeError,str)
+                if not passed then
+                    printerr(("error occurred on onRead() \n%s"):format(err))
+                end
+            end
+        end
+        runNext()
+    end
     read_pipe:read_start(function (...)
-        coroutine.wrap(onRead)(...)
+        coroutine.wrap(queueOnRead)(...)
     end)
 
     -- set error handler
@@ -289,7 +327,7 @@ function worker:request(data)
     self[id] = routine
     self.__request_ids = id+1
 
-    self.__write_pipe:write(json.encode({r=0; d=data; i=id}))
+    self.__write_pipe:write(json.encode({r=0; d=data; i=id}).."\n")
     local hasError,result = coroutine.yield()
 
     if hasError then error(result) end
@@ -306,12 +344,12 @@ function worker:protectedRequest(data)
     self[id] = routine
     self.__request_ids = id+1
 
-    self.__write_pipe:write(json.encode({r=0; d=data; i=id}))
+    self.__write_pipe:write(json.encode({r=0; d=data; i=id}).."\n")
     local hasError,result = coroutine.yield()
     return not hasError,result
 end
 
-local KILL = '{"id":"KILL"}'
+local KILL = '{"id":"KILL"}\n'
 function worker:kill()
     self.__write_pipe:write(KILL)
     self.__read_pipe:read_stop()
@@ -336,6 +374,9 @@ end
 function worker:ready(...)
     local dumped = self.__dumped; self.__dumped = nil
     self.__waiting_start = coroutine.running()
+    if not self.__waiting_start then
+        error("handler.ready must be called on coroutine")
+    end
     local thread = uv.new_thread(
         worker.__inner,
         dumped,
@@ -372,8 +413,10 @@ function worker:setWorkHandler(workHandler)
     self.__dumped = dumped
 end
 
-local START = '{"id":"START"}'
-local READY = '{"id":"READY"}'
+local START_REQUEST = '{"id":"START"}\n'
+local READY_REQUEST = '{"id":"READY"}\n'
+local START_CHUNK = '{"id":"START"}'
+local READY_CHUNK = '{"id":"READY"}'
 function worker.new(name,workHandler)
     if type(name) ~= "string" then
         error(("worker.new argument #1 'name' must be string, but got %s"):format(name))
@@ -479,91 +522,106 @@ function worker.new(name,workHandler)
     setmetatable(this,worker)
 
     read_pipe:read_start(function(err, chunk)
-        if err then
-            this:printerr(("error occurred on reading pipe\n%s"):format(tostring(err)))
-            return
-        end
-
-        -- handshake
-        if chunk == READY then
-            write_pipe:write(READY)
-            return
-        elseif chunk == START then
-            local waittingStart = this.__waiting_start
-            if not waittingStart then
-                this:printerr("received START before worker:ready called")
-                return
-            end
-            this.__waiting_start = nil
-
-            local pass,resumeErr = coroutine.resume(waittingStart)
-            if not pass then this:printerr(("error occurred on resume READY routine\n%s"):format(tostring(resumeErr))) end
-            return
-        end
-
-        -- decode data
-        local data,_,decodeErr = json.decode(chunk)
-        if not data then
-            this:printerr(("error occurred on decoding json.\n%s\nchunk : %s"):format(tostring(decodeErr),tostring(chunk)))
-            return
-        end
-
-        -- check data
-        local id = data.i
-        local direction = data.r
-        if not id then
-            this:printerr(("job id not got.\nchunk : %s"):format(chunk))
-            return
-        elseif not direction then
-            this:printerr(("direction not got.\nchunk : %s"):format(chunk))
-            return
-        end
-
-        -- reverse pipe, request result received (child thread => main thread)
-        if direction == 1 then
-            local func = this.__func
-            if not func then
-                this:printerr(("received data before onRequest called\nchunk : %s"):format(tostring(chunk)))
-                return
-            end
-
-            local pass,result = pcall(func,data.d)
-            if not pass then -- catch error
-                this:printerr(("error occurred on calling onRequest function\n%s\nchunk : %s"):format(tostring(result),tostring(chunk)))
-                write_pipe:write(json.encode{
-                    i=id; e=tostring(result); r=1
-                })
-                return
-            end
-
-            -- write result
-            write_pipe:write(json.encode{
-                i=id; d=result; r=1
-            })
-            return
-        -- main thread => child thread
-        elseif direction == 0 then
-            local routine = this[id]
-            this[id] = nil
-            if not routine then
-                this:printerr(("got request result from child thread, but callback routine was not found\bchunk : %s"):format(tostring(chunk)))
-                return
-            end
-            local derr = data.e
-            local ddata = data.d
-            local hasError = derr and true or false
-            local pass,errResume = coroutine.resume(routine,hasError,hasError and derr or ddata)
-            if not pass then
-                this:printerr(("got request result from child thread, but error occurred on callback routine\n%s\nchunk : %s"):format(tostring(errResume),tostring(chunk)))
-            end
-            return
-        else
-            this:printerr(("unknown direction int got (%s)\nchunk : %s"):format(tostring(direction),tostring(chunk)))
-            return
-        end
+        coroutine.wrap(this.queueOnRead)(this,err,chunk)
     end)
 
     return this
+end
+
+function worker:onRead(err, chunk)
+    if err then
+        self:printerr(("error occurred on reading pipe\n%s"):format(tostring(err)))
+        return
+    end
+
+    -- handshake
+    if chunk == READY_CHUNK then
+        self.__write_pipe:write(READY_REQUEST)
+        return
+    elseif chunk == START_CHUNK then
+        local waittingStart = self.__waiting_start
+        if not waittingStart then
+            self:printerr("received START before worker:ready called")
+            return
+        end
+        self.__waiting_start = nil
+
+        local pass,resumeErr = coroutine.resume(waittingStart)
+        if not pass then self:printerr(("error occurred on resume READY routine\n%s"):format(tostring(resumeErr))) end
+        return
+    end
+
+    -- decode data
+    local data,_,decodeErr = json.decode(chunk)
+    if not data then
+        self:printerr(("error occurred on decoding json.\n%s\nchunk : %s"):format(tostring(decodeErr),tostring(chunk)))
+        return
+    end
+
+    -- check data
+    local id = data.i
+    local direction = data.r
+    if not id then
+        self:printerr(("job id not got.\nchunk : %s"):format(chunk))
+        return
+    elseif not direction then
+        self:printerr(("direction not got.\nchunk : %s"):format(chunk))
+        return
+    end
+
+    -- reverse pipe, request result received (child thread => main thread)
+    if direction == 1 then
+        local func = self.__func
+        if not func then
+            self:printerr(("received data before onRequest called\nchunk : %s"):format(tostring(chunk)))
+            return
+        end
+
+        local pass,result = pcall(func,data.d)
+        if not pass then -- catch error
+            self:printerr(("error occurred on calling onRequest function\n%s\nchunk : %s"):format(tostring(result),tostring(chunk)))
+            self.__write_pipe:write(json.encode{
+                i=id; e=tostring(result); r=1
+            }.."\n")
+            return
+        end
+
+        -- write result
+        self.__write_pipe:write(json.encode{
+            i=id; d=result; r=1
+        }.."\n")
+        return
+    -- main thread => child thread
+    elseif direction == 0 then
+        local routine = self[id]
+        self[id] = nil
+        if not routine then
+            self:printerr(("got request result from child thread, but callback routine was not found\bchunk : %s"):format(tostring(chunk)))
+            return
+        end
+        local derr = data.e
+        local ddata = data.d
+        local hasError = derr and true or false
+        local pass,errResume = coroutine.resume(routine,hasError,hasError and derr or ddata)
+        if not pass then
+            self:printerr(("got request result from child thread, but error occurred on callback routine\n%s\nchunk : %s"):format(tostring(errResume),tostring(chunk)))
+        end
+        return
+    else
+        self:printerr(("unknown direction int got (%s)\nchunk : %s"):format(tostring(direction),tostring(chunk)))
+        return
+    end
+end
+
+local gmatch = string.gmatch
+function worker:queueOnRead(pipeErr,pipeChunk)
+    if pipeErr or not pipeChunk then
+        self:onRead(pipeErr,pipeChunk)
+    else
+        for str in gmatch(pipeChunk,"[^\n]+") do
+            self:onRead(pipeErr,str)
+        end
+    end
 end
 
 -- local work = worker.new("testingThread",
@@ -589,5 +647,6 @@ end
 -- print(work:request(123123))
 -- work:kill()
 -- require"logger".info(work)
+-- print("적당히해라")
 
 return worker
