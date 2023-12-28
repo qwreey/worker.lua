@@ -1,9 +1,14 @@
-return {
-  name = "luaiod/worker.lua",
-  version = "2.1.0",
-  dependencies = {},
-  license = "MIT",
-  homepage = "https://github.com/qwreey75/worker.lua",
-  description = "",
-  tags = {},
-}
+  return {
+    name = "qwreey/worker",
+    version = "2.1.1",
+    description = "Create UV based threading worker",
+    tags = { "lua", "luvit", "threading" },
+    license = "MIT",
+    author = { name = "qwreey", email = "me@qwreey.moe" },
+    homepage = "https://github.com/qwreey/worker.lua",
+    dependencies = {},
+    files = {
+      "**.lua",
+    }
+  }
+  
